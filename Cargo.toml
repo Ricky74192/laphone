@@ -1,0 +1,15 @@
+[package]
+name = "laphone"
+version = "0.1.0"
+edition = "2021"
+description = "USB phone mirroring for Windows — plug-and-play, zero install on the phone, screen-off mirroring"
+license = "Apache-2.0"
+
+[dependencies]
+sdl2 = { version = "0.37", features = ["bundled"] }
+openh264 = "0.9"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
