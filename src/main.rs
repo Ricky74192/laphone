@@ -1,6 +1,18 @@
-// laphone M0 PoC — zero-install pipeline:
+// laphone M0 — zero-install USB mirroring pipeline:
 //   adb exec-out screenrecord --output-format=h264 → openh264 decode → SDL2 window
-//   left click → adb shell input tap ; ESC / window close → quit
+// Input (all via adb shell, shell-UID injection):
+//   left drag  → input motionevent DOWN/MOVE/UP (tap = quick down+up)
+//   right click→ KEYCODE_BACK ; middle click → KEYCODE_HOME
+//   wheel      → input swipe (scroll) ; Ctrl+S → soft screen-off
+//   keys       → input keyevent (nav/control) ; text → input text (incl. IME)
+//   Ctrl+Q / window close → quit ; ESC → back
+//
+// Modes:
+//   laphone.exe [serial]   — mirror window for one device (serial optional:
+//                            defaults to the only connected device)
+//   laphone.exe --daemon   — background watcher: polls `adb devices`, opens a
+//                            mirror per plugged device, closes it on unplug
+//   laphone.exe --install / --uninstall — register/remove autostart (Run key)
 //
 // Design notes:
 // - Reader thread pushes raw stream chunks over an mpsc channel so the SDL
@@ -10,6 +22,9 @@
 //   on the fresh SPS/PPS of the new stream.
 // - OpenH264 strides are padded (e.g. 1080 → 1088), but SDL IYUV textures need
 //   exact pitches, so each frame is repacked into tight Y/U/V planes.
+#![windows_subsystem = "windows"]
+
+use std::collections::HashMap;
 use std::env;
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
@@ -19,7 +34,7 @@ use std::time::{Duration, Instant};
 use openh264::decoder::Decoder;
 use openh264::formats::YUVSource;
 use sdl2::event::Event;
-use sdl2::keyboard::Keycode;
+use sdl2::keyboard::{Keycode, Mod};
 use sdl2::mouse::MouseButton;
 use sdl2::pixels::PixelFormatEnum;
 use sdl2::rect::Rect;
@@ -27,6 +42,18 @@ use sdl2::rect::Rect;
 const PHONE_W: u32 = 1080; // TODO: auto-detect via `adb shell wm size`
 const PHONE_H: u32 = 2400;
 const BITRATE: &str = "8M";
+
+/// Suppress the console window of spawned console-subsystem children (adb,
+/// reg) when this process is a GUI-subsystem binary without a console —
+/// otherwise every `adb devices` poll (daemon: 2s) flashes a black window.
+fn no_window(cmd: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    cmd
+}
 
 /// Letterboxed view rect + scale for the given window size (keeps phone aspect).
 fn view_rect(win_w: u32, win_h: u32) -> (Rect, f32) {
@@ -38,12 +65,29 @@ fn view_rect(win_w: u32, win_h: u32) -> (Rect, f32) {
     (Rect::new(dx, dy, dw as u32, dh as u32), scale)
 }
 
+/// Map window coords to phone coords inside the letterboxed view; None if outside.
+fn map_to_phone(x: i32, y: i32, win_w: u32, win_h: u32) -> Option<(i32, i32)> {
+    let (dst, scale) = view_rect(win_w, win_h);
+    if x >= dst.x()
+        && x < dst.x() + dst.width() as i32
+        && y >= dst.y()
+        && y < dst.y() + dst.height() as i32
+    {
+        let px = ((x - dst.x()) as f32 / scale).clamp(0.0, PHONE_W as f32 - 1.0) as i32;
+        let py = ((y - dst.y()) as f32 / scale).clamp(0.0, PHONE_H as f32 - 1.0) as i32;
+        Some((px, py))
+    } else {
+        None
+    }
+}
+
 fn spawn_recorder(serial: Option<&str>) -> std::io::Result<Child> {
     let mut cmd = Command::new("adb");
     if let Some(s) = serial {
         cmd.arg("-s").arg(s);
     }
-    cmd.arg("exec-out")
+    no_window(&mut cmd)
+        .arg("exec-out")
         .arg("screenrecord")
         .arg("--output-format=h264")
         .arg("--bit-rate")
@@ -56,12 +100,41 @@ fn spawn_recorder(serial: Option<&str>) -> std::io::Result<Child> {
         .spawn()
 }
 
-fn tap(serial: Option<&str>, x: i32, y: i32) {
-    let mut cmd = Command::new("adb");
-    if let Some(s) = serial {
-        cmd.arg("-s").arg(s);
-    }
-    let _ = cmd.arg("shell").arg(format!("input tap {x} {y}")).status();
+/// Map an SDL keycode to an Android keycode (nav/control keys only; printable
+/// text flows through SDL_TEXTINPUT → `input text` instead).
+fn keycode_to_android(k: Keycode) -> Option<i32> {
+    Some(match k {
+        Keycode::Escape => 4,                     // KEYCODE_BACK
+        Keycode::Return | Keycode::KpEnter => 66, // KEYCODE_ENTER
+        Keycode::Backspace => 67,                 // KEYCODE_DEL
+        Keycode::Tab => 61,                       // KEYCODE_TAB
+        Keycode::Space => 62,                     // KEYCODE_SPACE
+        Keycode::Delete => 112,                   // KEYCODE_FORWARD_DEL
+        Keycode::Home => 3,                       // KEYCODE_HOME
+        Keycode::End => 123,                      // KEYCODE_MOVE_END
+        Keycode::PageUp => 92,                    // KEYCODE_PAGE_UP
+        Keycode::PageDown => 93,                  // KEYCODE_PAGE_DOWN
+        Keycode::Up => 19,                        // KEYCODE_DPAD_UP
+        Keycode::Down => 20,                      // KEYCODE_DPAD_DOWN
+        Keycode::Left => 21,                      // KEYCODE_DPAD_LEFT
+        Keycode::Right => 22,                     // KEYCODE_DPAD_RIGHT
+        _ => return None,
+    })
+}
+
+/// `adb shell input keyevent <code>`
+fn keyevent(serial: Option<&str>, code: i32) {
+    let _ = shell(serial, &format!("input keyevent {code}"));
+}
+
+/// `adb shell input motionevent <ACTION> x y` — DOWN / MOVE / UP (tap + drag).
+fn motion(serial: Option<&str>, action: &str, x: i32, y: i32) {
+    let _ = shell(serial, &format!("input motionevent {action} {x} {y}"));
+}
+
+/// `adb shell input text <t>` — with `%s` escaping for spaces.
+fn text_input(serial: Option<&str>, t: &str) {
+    let _ = shell(serial, &format!("input text {}", t.replace(' ', "%s")));
 }
 
 /// Run an adb shell command, return trimmed stdout (None on failure).
@@ -70,7 +143,7 @@ fn shell(serial: Option<&str>, cmd: &str) -> Option<String> {
     if let Some(s) = serial {
         c.arg("-s").arg(s);
     }
-    let out = c.arg("shell").arg(cmd).output().ok()?;
+    let out = no_window(&mut c).arg("shell").arg(cmd).output().ok()?;
     if out.status.success() {
         Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
     } else {
@@ -146,8 +219,109 @@ fn nal_starts(data: &[u8]) -> Vec<usize> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let serial = env::args().nth(1); // optional: adb serial
+    match env::args().nth(1).as_deref() {
+        Some("--daemon") => daemon_main(),
+        Some("--install") => autostart(true),
+        Some("--uninstall") => autostart(false),
+        serial => mirror_main(serial.map(str::to_string)),
+    }
+}
 
+/// Poll `adb devices`, keep a mirror per plugged device, stop it on unplug.
+fn daemon_main() -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!("laphone daemon: watching for USB devices…");
+    let mut mirrors: HashMap<String, Child> = HashMap::new();
+    loop {
+        let devices = adb_devices();
+        for d in &devices {
+            if !mirrors.contains_key(d) {
+                eprintln!("device {d} — starting mirror");
+                match no_window(&mut Command::new(env::current_exe()?))
+                    .arg(d)
+                    .spawn()
+                {
+                    Ok(c) => {
+                        mirrors.insert(d.clone(), c);
+                    }
+                    Err(e) => eprintln!("mirror spawn failed: {e}"),
+                }
+            }
+        }
+        let gone: Vec<String> = mirrors
+            .iter()
+            .filter(|(s, _)| !devices.contains(*s))
+            .map(|(s, _)| s.clone())
+            .collect();
+        for g in gone {
+            eprintln!("device {g} unplugged — stopping mirror");
+            if let Some(mut c) = mirrors.remove(&g) {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+        let exited: Vec<String> = mirrors
+            .iter_mut()
+            .filter_map(|(s, c)| match c.try_wait() {
+                Ok(Some(_)) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        for s in exited {
+            eprintln!("mirror {s} exited on its own");
+            mirrors.remove(&s);
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+/// `adb devices` → serials in "device" state.
+fn adb_devices() -> Vec<String> {
+    let out = match no_window(&mut Command::new("adb")).arg("devices").output() {
+        Ok(o) => o.stdout,
+        Err(_) => return Vec::new(),
+    };
+    let text = String::from_utf8_lossy(&out);
+    text.lines()
+        .skip(1)
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            let serial = it.next()?;
+            if it.next() == Some("device") {
+                Some(serial.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Register/remove the HKCU Run key so the daemon starts at login.
+fn autostart(install: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+    if install {
+        let value = format!("\"{}\" --daemon", env::current_exe()?.display());
+        let st = no_window(&mut Command::new("reg"))
+            .args(["add", key, "/v", "laphone", "/d", &value, "/f"])
+            .status()?;
+        if st.success() {
+            eprintln!("autostart installed: {value}");
+        } else {
+            eprintln!("autostart install failed (reg add exit {:?})", st.code());
+        }
+    } else {
+        let st = no_window(&mut Command::new("reg"))
+            .args(["delete", key, "/v", "laphone", "/f"])
+            .status()?;
+        if st.success() {
+            eprintln!("autostart removed");
+        } else {
+            eprintln!("autostart remove failed (reg delete exit {:?})", st.code());
+        }
+    }
+    Ok(())
+}
+
+fn mirror_main(serial: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
     // reader thread: adb pipe → channel; restarts screenrecord on stream end
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
     let serial_thread = serial.clone();
@@ -210,37 +384,103 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut title_t = Instant::now();
     let mut soft_off = false;
     let mut saved_display: Option<(String, String, String)> = None;
+    let mut drag: Option<(i32, i32)> = None; // active pointer (phone coords)
 
     'main: loop {
+        let mouse = events.mouse_state(); // owned snapshot (poll_iter borrows events mutably)
+        let (win_w, win_h) = canvas.output_size().unwrap_or((init_w, init_h));
         for ev in events.poll_iter() {
             match ev {
                 Event::Quit { .. } => break 'main,
+                // Ctrl+Q → quit
                 Event::KeyDown {
-                    keycode: Some(Keycode::Escape),
+                    keycode: Some(Keycode::Q),
+                    keymod,
                     ..
-                } => break 'main,
+                } if keymod.intersects(Mod::LCTRLMOD | Mod::RCTRLMOD) => break 'main,
+                // Ctrl+S → soft screen-off (Ctrl combos don't generate text input)
                 Event::KeyDown {
                     keycode: Some(Keycode::S),
+                    keymod,
                     ..
-                } => toggle_soft_off(serial.as_deref(), &mut soft_off, &mut saved_display),
+                } if keymod.intersects(Mod::LCTRLMOD | Mod::RCTRLMOD) => {
+                    toggle_soft_off(serial.as_deref(), &mut soft_off, &mut saved_display);
+                }
+                // nav / control keys → keyevent
+                Event::KeyDown {
+                    keycode: Some(k), ..
+                } => {
+                    if let Some(code) = keycode_to_android(k) {
+                        keyevent(serial.as_deref(), code);
+                    }
+                }
+                // printable text (incl. IME composition commit) → input text
+                Event::TextInput { text, .. } if !text.is_empty() => {
+                    text_input(serial.as_deref(), &text);
+                }
+                // left press → touch DOWN (drag start); tap = DOWN + UP
                 Event::MouseButtonDown {
                     x,
                     y,
                     mouse_btn: MouseButton::Left,
                     ..
                 } => {
-                    let (win_w, win_h) = canvas.output_size().unwrap_or((init_w, init_h));
-                    let (dst, scale) = view_rect(win_w, win_h);
-                    if x >= dst.x()
-                        && x < dst.x() + dst.width() as i32
-                        && y >= dst.y()
-                        && y < dst.y() + dst.height() as i32
-                    {
-                        let px = ((x - dst.x()) as f32 / scale)
-                            .clamp(0.0, PHONE_W as f32 - 1.0) as i32;
-                        let py = ((y - dst.y()) as f32 / scale)
-                            .clamp(0.0, PHONE_H as f32 - 1.0) as i32;
-                        tap(serial.as_deref(), px, py);
+                    if let Some((px, py)) = map_to_phone(x, y, win_w, win_h) {
+                        drag = Some((px, py));
+                        motion(serial.as_deref(), "DOWN", px, py);
+                    }
+                }
+                // right click → back
+                Event::MouseButtonDown {
+                    x,
+                    y,
+                    mouse_btn: MouseButton::Right,
+                    ..
+                } => {
+                    if map_to_phone(x, y, win_w, win_h).is_some() {
+                        keyevent(serial.as_deref(), 4);
+                    }
+                }
+                // middle click → home
+                Event::MouseButtonDown {
+                    x,
+                    y,
+                    mouse_btn: MouseButton::Middle,
+                    ..
+                } => {
+                    if map_to_phone(x, y, win_w, win_h).is_some() {
+                        keyevent(serial.as_deref(), 3);
+                    }
+                }
+                // drag: track the pointer, stream MOVE events
+                Event::MouseMotion { x, y, .. } => {
+                    if drag.is_some() {
+                        if let Some((px, py)) = map_to_phone(x, y, win_w, win_h) {
+                            drag = Some((px, py));
+                            motion(serial.as_deref(), "MOVE", px, py);
+                        }
+                    }
+                }
+                // left release → touch UP (tap or drag end)
+                Event::MouseButtonUp {
+                    x,
+                    y,
+                    mouse_btn: MouseButton::Left,
+                    ..
+                } => {
+                    if let Some((sx, sy)) = drag.take() {
+                        let pos = map_to_phone(x, y, win_w, win_h).unwrap_or((sx, sy));
+                        motion(serial.as_deref(), "UP", pos.0, pos.1);
+                    }
+                }
+                Event::MouseWheel { y, .. } if y != 0 => {
+                    // wheel up (y>0) = finger drags down = scroll up; wheel down mirrors it
+                    if let Some((px, py)) = map_to_phone(mouse.x(), mouse.y(), win_w, win_h) {
+                        let d = 60 * y.signum();
+                        let _ = shell(
+                            serial.as_deref(),
+                            &format!("input swipe {px} {} {px} {} 80", py - d, py + d),
+                        );
                     }
                 }
                 _ => {}
