@@ -704,6 +704,7 @@ fn mirror_main(serial: Option<String>) -> Result<(), Box<dyn std::error::Error>>
     let mut saved_display: Option<(String, String, String)> = None;
     let mut drag: Option<(i32, i32)> = None; // active pointer (phone coords)
     let mut drag_moved = false; // any MOVE since DOWN → drag, not tap
+    let mut last_move = Instant::now(); // throttle: input cmd is ~50-70ms
     let mut input_pipe = InputPipe::open(serial.as_deref());
     let mut input_server = InputServer::start(serial.as_deref());
     if input_server.is_some() {
@@ -784,20 +785,29 @@ fn mirror_main(serial: Option<String>) -> Result<(), Box<dyn std::error::Error>>
                         keyevent(&mut input_pipe, serial.as_deref(), 3);
                     }
                 }
-                // drag: track the pointer, stream MOVE events
+                // drag: track the pointer, stream MOVE events — but throttle
+                // them: each `input` command takes ~50-70ms on the phone, so
+                // sending every mouse-report position queues up and the
+                // device position lags further and further behind (the
+                // "stutter while dragging" effect). Sending the newest
+                // position at ~30/s keeps the device close to the cursor
+                // without a growing backlog.
                 Event::MouseMotion { x, y, .. } => {
                     if drag.is_some() {
                         if let Some((px, py)) = map_to_phone(x, y, win_w, win_h) {
                             drag = Some((px, py));
-                            drag_moved = true;
-                            motion(
-                                &mut input_server,
-                                &mut input_pipe,
-                                serial.as_deref(),
-                                "MOVE",
-                                px,
-                                py,
-                            );
+                            if !drag_moved || last_move.elapsed() >= Duration::from_millis(35) {
+                                drag_moved = true;
+                                last_move = Instant::now();
+                                motion(
+                                    &mut input_server,
+                                    &mut input_pipe,
+                                    serial.as_deref(),
+                                    "MOVE",
+                                    px,
+                                    py,
+                                );
+                            }
                         }
                     }
                 }
@@ -827,6 +837,18 @@ fn mirror_main(serial: Option<String>) -> Result<(), Box<dyn std::error::Error>>
                                 ),
                             );
                         } else {
+                            // re-sync the position if the last MOVE was
+                            // throttled away, so UP lands at the cursor
+                            if last_move.elapsed() >= Duration::from_millis(35) {
+                                motion(
+                                    &mut input_server,
+                                    &mut input_pipe,
+                                    serial.as_deref(),
+                                    "MOVE",
+                                    pos.0,
+                                    pos.1,
+                                );
+                            }
                             motion(
                                 &mut input_server,
                                 &mut input_pipe,
