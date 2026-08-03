@@ -16,6 +16,8 @@ Test methodology: `adb exec-out screenrecord --output-format=h264 --size 1080x24
 | 2026-08-03 | **Screen-off matrix** (brightness 59/auto, stayon true) | — | **A** awake 5s: 193 frames. **B** KEYCODE_POWER → Dozing 5s: 33 frames (2-3 fade-out frames then stream dies; earlier session got 0 bytes). **C** soft-off (brightness 0 → MIUI clamps to 1 + stayon) 6s: **131 frames, continuous — screenrecord survives soft-off**. Live check: laphone rendered 4.7 fps with screen visually black. **Conclusion: 真息屏 needs M1 server (wakelock + power-mode); 软息屏 works on the M0 zero-install pipeline → built as S-key "SOFT-OFF" mode (saves/restores brightness+mode+stay_on_while_plugged_in).** |
 | 2026-08-03 | Stall diagnosis (repeated "phone fell asleep" events) | — | **Root cause: USB drop, not MIUI sleep.** After unplug, stayon only applies while plugged → screen dozes → screenrecord dies. Auto-wake added: on stall, `KEYCODE_WAKEUP` every 5s while adb reachable; exits only when adb unreachable. Verified offline: stays alive with shell OK, exits with shell dead. |
 | 2026-08-03 | Manual gates pending (need device) | — | New letterboxed click mapping; S-key with **IME in English mode** (Chinese IME swallows ASCII keys — likely cause of earlier "S 没反应"); window resize. |
+| 2026-08-03 | Window resize (SetWindowPos 600×900, 250×500) | **PASS** | No crash; render continues at both sizes (letterbox path OK). |
+| 2026-08-03 | "Low fps on static screen" mystery | — | **Not a bug: screenrecord fps = display update rate.** Static black/locked screen → ~0.5 fps (frames only emitted on content change); after KEYCODE_HOME (launcher visible) → 11.3 fps instantly. Brightness was normal (65/auto). M1 server will behave the same (surface capture). |
 
 ## Next tests
 
