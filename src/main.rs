@@ -387,7 +387,15 @@ fn toggle_soft_off(
         let mode = shell(serial, "settings get system screen_brightness_mode").unwrap_or_default();
         let stay_on =
             shell(serial, "settings get global stay_on_while_plugged_in").unwrap_or_default();
-        *saved = Some((brightness, mode, stay_on));
+        // Normalize an abnormally-low current brightness (<5, e.g. a leftover
+        // soft-off or a stale value): restoring it later would leave the
+        // screen looking black and the user would toggle again, ping-ponging
+        // between 0 and 1 forever.
+        let b = match brightness.trim().parse::<i32>() {
+            Ok(v) if v >= 5 => brightness,
+            _ => "50".to_string(),
+        };
+        *saved = Some((b, mode, stay_on));
         let _ = shell(serial, "svc power stayon true");
         let _ = shell(serial, "settings put system screen_brightness_mode 0");
         let _ = shell(serial, "settings put system screen_brightness 0");
@@ -413,6 +421,13 @@ fn toggle_soft_off(
         );
         *on = false;
     }
+}
+
+/// A decoded, tight-packed IYUV frame (no stride padding), ready for SDL.
+struct YuvFrame {
+    w: u32,
+    h: u32,
+    data: Vec<u8>, // [y: w*h][u: w*h/4][v: w*h/4]
 }
 
 /// Positions of Annex-B start codes (00 00 01 / 00 00 00 01), pointing at the
@@ -544,8 +559,16 @@ fn autostart(install: bool) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn mirror_main(serial: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
-    // reader thread: adb pipe → channel; restarts screenrecord on stream end
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    // Pipeline: reader thread (adb pipe → raw chunks) → decode thread
+    // (H.264 → tight-packed YUV frames) → main thread (SDL render).
+    // Decoding on a worker keeps the SDL event loop responsive — with video
+    // content, software decoding of 1080p frames takes tens of ms; doing it
+    // on the main thread froze the window ("not responding").
+    let (tx_raw, rx_raw) = mpsc::channel::<Vec<u8>>();
+    // bounded: the decode thread blocks when the renderer is behind (natural
+    // backpressure, ~2 frames of memory), and the main loop skips stale
+    // frames by draining with try_recv
+    let (tx_frame, rx_frame) = mpsc::sync_channel::<YuvFrame>(2);
     let serial_thread = serial.clone();
     std::thread::spawn(move || {
         loop {
@@ -561,10 +584,10 @@ fn mirror_main(serial: Option<String>) -> Result<(), Box<dyn std::error::Error>>
                     }
                     Err(_) => break,
                     Ok(n) => {
-                        if tx.send(chunk[..n].to_vec()).is_err() {
+                        if tx_raw.send(chunk[..n].to_vec()).is_err() {
                             let _ = child.kill();
                             let _ = child.wait(); // reap
-                            return; // main loop gone
+                            return; // decode thread gone
                         }
                     }
                 }
@@ -575,6 +598,84 @@ fn mirror_main(serial: Option<String>) -> Result<(), Box<dyn std::error::Error>>
             }
             eprintln!("recorder ended — restarting…");
             std::thread::sleep(Duration::from_millis(500));
+        }
+    });
+
+    // decode thread: owns the Annex-B accumulator, the decoder and the
+    // reusable tight buffer; drops frames when the renderer is behind
+    std::thread::spawn(move || {
+        let mut decoder = match Decoder::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("decoder init failed: {e}");
+                return;
+            }
+        };
+        let mut pending: Vec<u8> = Vec::with_capacity(1 << 20);
+        let mut tight: Vec<u8> = Vec::new();
+        let mut decode_errors: u32 = 0;
+        while let Ok(data) = rx_raw.recv() {
+            pending.extend_from_slice(&data);
+            // cap the accumulator: if decoding falls behind (high-bitrate
+            // video), drop everything and resync on the next keyframe rather
+            // than growing memory without bound
+            if pending.len() > 8 * 1024 * 1024 {
+                pending.clear();
+                continue;
+            }
+            let starts = nal_starts(&pending);
+            for w in starts.windows(2) {
+                let nal = &pending[w[0]..w[1]];
+                match decoder.decode(nal) {
+                    Ok(Some(frame)) => {
+                        let (w, h) = frame.dimensions();
+                        let (sy, su, sv) = frame.strides();
+                        let y = frame.y();
+                        let u = frame.u();
+                        let v = frame.v();
+                        let ylen = w * h;
+                        let uvlen = w * h / 4;
+                        if tight.len() != ylen + uvlen * 2 {
+                            tight.resize(ylen + uvlen * 2, 0);
+                        }
+                        for row in 0..h {
+                            tight[row * w..(row + 1) * w]
+                                .copy_from_slice(&y[row * sy..row * sy + w]);
+                        }
+                        for row in 0..h / 2 {
+                            let uo = ylen + row * (w / 2);
+                            tight[uo..uo + w / 2]
+                                .copy_from_slice(&u[row * su..row * su + w / 2]);
+                            let vo = ylen + uvlen + row * (w / 2);
+                            tight[vo..vo + w / 2]
+                                .copy_from_slice(&v[row * sv..row * sv + w / 2]);
+                        }
+                        // bounded send: if the renderer is behind we block
+                        // here (backpressure); the main loop drains and skips
+                        // stale frames, so this stays near-instant
+                        if tx_frame
+                            .send(YuvFrame {
+                                w: w as u32,
+                                h: h as u32,
+                                data: tight.clone(),
+                            })
+                            .is_err()
+                        {
+                            return; // main thread gone
+                        }
+                    }
+                    Ok(None) => {} // need more data
+                    Err(e) => {
+                        decode_errors += 1;
+                        if decode_errors <= 5 {
+                            eprintln!("decode error: {e}");
+                        }
+                    }
+                }
+            }
+            if let Some(&keep) = starts.last() {
+                pending.drain(..keep); // keep only the trailing partial NAL
+            }
         }
     });
 
@@ -594,11 +695,6 @@ fn mirror_main(serial: Option<String>) -> Result<(), Box<dyn std::error::Error>>
     let tc = canvas.texture_creator();
     let mut texture = tc.create_texture_streaming(PixelFormatEnum::IYUV, PHONE_W, PHONE_H)?;
     let mut events = sdl.event_pump()?;
-
-    let mut decoder = Decoder::new()?;
-    let mut pending: Vec<u8> = Vec::with_capacity(1 << 20); // Annex-B accumulator
-    let mut tight: Vec<u8> = Vec::new(); // reusable tight-packed YUV plane buffer
-    let mut decode_errors: u32 = 0;
 
     let mut frames: u32 = 0;
     let started = Instant::now();
@@ -760,87 +856,62 @@ fn mirror_main(serial: Option<String>) -> Result<(), Box<dyn std::error::Error>>
             }
         }
 
-        // drain whatever arrived from the reader thread
+        // render the freshest decoded frame (skip stale ones); the decode
+        // thread drops frames when we fall behind, so try_recv only ever
+        // yields the newest one
         let mut got_data = false;
-        while let Ok(data) = rx.recv_timeout(Duration::from_millis(10)) {
+        let mut latest: Option<YuvFrame> = None;
+        while let Ok(frame) = rx_frame.try_recv() {
             got_data = true;
-            pending.extend_from_slice(&data);
-            let starts = nal_starts(&pending);
-            for w in starts.windows(2) {
-                let nal = &pending[w[0]..w[1]];
-                match decoder.decode(nal) {
-                    Ok(Some(frame)) => {
-                        let (w, h) = frame.dimensions();
-                        let (sy, su, sv) = frame.strides();
-                        let y = frame.y();
-                        let u = frame.u();
-                        let v = frame.v();
-                        let ylen = w * h;
-                        let uvlen = w * h / 4;
-                        if tight.len() != ylen + uvlen * 2 {
-                            tight.resize(ylen + uvlen * 2, 0);
-                        }
-                        for row in 0..h {
-                            tight[row * w..(row + 1) * w]
-                                .copy_from_slice(&y[row * sy..row * sy + w]);
-                        }
-                        for row in 0..h / 2 {
-                            tight[ylen + row * (w / 2)..ylen + (row + 1) * (w / 2)]
-                                .copy_from_slice(&u[row * su..row * su + w / 2]);
-                            tight[ylen + uvlen + row * (w / 2)..ylen + uvlen + (row + 1) * (w / 2)]
-                                .copy_from_slice(&v[row * sv..row * sv + w / 2]);
-                        }
-                        texture.update_yuv(
-                            None,
-                            &tight[..ylen],
-                            w,
-                            &tight[ylen..ylen + uvlen],
-                            w / 2,
-                            &tight[ylen + uvlen..],
-                            w / 2,
-                        )?;
-                        let (win_w, win_h) = canvas.output_size()?;
-                        let (dst, _) = view_rect(win_w, win_h);
-                        canvas.copy(&texture, None, Some(dst))?;
-                        canvas.present();
-                        frames += 1;
-                        if title_t.elapsed().as_secs() >= 2 {
-                            let fps = frames as f32 / started.elapsed().as_secs_f32();
-                            let state = if soft_off { " [SOFT-OFF]" } else { "" };
-                            let _ = canvas
-                                .window_mut()
-                                .set_title(&format!("laphone M0 — {fps:.1} fps{state}"));
-                            title_t = Instant::now();
-                        }
-                    }
-                    Ok(None) => {} // need more data
-                    Err(e) => {
-                        decode_errors += 1;
-                        if decode_errors <= 5 {
-                            eprintln!("decode error: {e}");
-                        }
-                    }
-                }
-            }
-            if let Some(&keep) = starts.last() {
-                pending.drain(..keep); // keep only the trailing partial NAL
-            }
+            latest = Some(frame);
         }
         if got_data {
             last_data = Instant::now();
-        } else if last_data.elapsed() > Duration::from_secs(5) {
-            // stream stalled: the screen may have fallen asleep (screenrecord
-            // needs the display on). Wake it; if adb itself is unreachable
-            // (USB unplugged), give up.
-            if !input_cmd(
-                &mut input_pipe,
-                serial.as_deref(),
-                "input keyevent KEYCODE_WAKEUP",
-            ) {
-                eprintln!("adb unreachable — exiting");
-                break 'main;
+        } else {
+            // no frame arrived: throttle the spin (the old recv_timeout
+            // blocked; try_recv needs an explicit pause)
+            std::thread::sleep(Duration::from_millis(5));
+            if last_data.elapsed() > Duration::from_secs(5) {
+                // stream stalled: the screen may have fallen asleep
+                // (screenrecord needs the display on). Wake it; if adb
+                // itself is unreachable (USB unplugged), give up.
+                if !input_cmd(
+                    &mut input_pipe,
+                    serial.as_deref(),
+                    "input keyevent KEYCODE_WAKEUP",
+                ) {
+                    eprintln!("adb unreachable — exiting");
+                    break 'main;
+                }
+                last_data = Instant::now();
             }
-            last_data = Instant::now();
+        }
+        if let Some(frame) = latest {
+            let w = frame.w as usize;
+            let ylen = w * frame.h as usize;
+            let uvlen = ylen / 4;
+            texture.update_yuv(
+                None,
+                &frame.data[..ylen],
+                w,
+                &frame.data[ylen..ylen + uvlen],
+                w / 2,
+                &frame.data[ylen + uvlen..],
+                w / 2,
+            )?;
+            let (win_w, win_h) = canvas.output_size()?;
+            let (dst, _) = view_rect(win_w, win_h);
+            canvas.copy(&texture, None, Some(dst))?;
+            canvas.present();
+            frames += 1;
+            if title_t.elapsed().as_secs() >= 2 {
+                let fps = frames as f32 / started.elapsed().as_secs_f32();
+                let state = if soft_off { " [SOFT-OFF]" } else { "" };
+                let _ = canvas
+                    .window_mut()
+                    .set_title(&format!("laphone M0 — {fps:.1} fps{state}"));
+                title_t = Instant::now();
+            }
         }
     }
 
