@@ -37,11 +37,17 @@ use openh264::formats::YUVSource;
 use sdl2::event::Event;
 use sdl2::keyboard::{Keycode, Mod};
 use sdl2::mouse::MouseButton;
-use sdl2::pixels::PixelFormatEnum;
-use sdl2::rect::Rect;
+use sdl2::pixels::{Color, PixelFormatEnum};
+use sdl2::rect::{Point, Rect};
+use sdl2::render::Canvas;
+use sdl2::video::Window;
 
 const PHONE_W: u32 = 1080; // TODO: auto-detect via `adb shell wm size`
 const PHONE_H: u32 = 2400;
+/// On-screen navigation bar height (window px): back / home / recents.
+/// Full-screen gesture navigation is awkward with a mouse, so the mirror
+/// window gets a classic three-key bar (LEFT=back, MIDDLE=home, RIGHT=recents).
+const NAV_BAR_H: i32 = 44;
 const BITRATE: &str = "8M";
 const WHEEL_DIST: i32 = 50; // half-distance per wheel notch (100 phone px total)
 const WHEEL_MS: u32 = 120; // slow drag per notch -> no fling inertia
@@ -59,13 +65,15 @@ fn no_window(cmd: &mut Command) -> &mut Command {
     cmd
 }
 
-/// Letterboxed view rect + scale for the given window size (keeps phone aspect).
+/// Letterboxed view rect + scale for the given window size (keeps phone
+/// aspect), excluding the on-screen navigation bar strip at the bottom.
 fn view_rect(win_w: u32, win_h: u32) -> (Rect, f32) {
-    let scale = (win_w as f32 / PHONE_W as f32).min(win_h as f32 / PHONE_H as f32);
+    let avail_h = win_h.saturating_sub(NAV_BAR_H as u32);
+    let scale = (win_w as f32 / PHONE_W as f32).min(avail_h as f32 / PHONE_H as f32);
     let dw = (PHONE_W as f32 * scale) as i32;
     let dh = (PHONE_H as f32 * scale) as i32;
     let dx = (win_w as i32 - dw) / 2;
-    let dy = (win_h as i32 - dh) / 2;
+    let dy = (avail_h as i32 - dh) / 2;
     (Rect::new(dx, dy, dw as u32, dh as u32), scale)
 }
 
@@ -83,6 +91,47 @@ fn map_to_phone(x: i32, y: i32, win_w: u32, win_h: u32) -> Option<(i32, i32)> {
     } else {
         None
     }
+}
+
+/// Draw the on-screen navigation bar (back / home / recents) at the bottom
+/// of the mirror window. Icons are simple geometry: left triangle, circle,
+/// square — no text rendering needed.
+fn draw_nav_bar(canvas: &mut Canvas<Window>, win_w: u32, win_h: u32) -> Result<(), String> {
+    let bar_y = win_h as i32 - NAV_BAR_H;
+    canvas.set_draw_color(Color::RGB(16, 18, 22));
+    canvas.fill_rect(Rect::new(0, bar_y, win_w, NAV_BAR_H as u32))?;
+    canvas.set_draw_color(Color::RGB(230, 230, 230));
+    let cy = bar_y + NAV_BAR_H / 2;
+    let s = 11; // icon half-size
+    // back: left-pointing triangle
+    let cx = win_w as i32 / 6;
+    let tri = [
+        Point::new(cx - s, cy),
+        Point::new(cx + s - 4, cy - s + 2),
+        Point::new(cx + s - 4, cy + s - 2),
+        Point::new(cx - s, cy),
+    ];
+    canvas.draw_lines(tri.as_slice())?;
+    // home: 16-gon circle
+    let cx = win_w as i32 / 2;
+    let tau = std::f32::consts::TAU;
+    for i in 0..16 {
+        let a1 = i as f32 * tau / 16.0;
+        let a2 = (i + 1) as f32 * tau / 16.0;
+        canvas.draw_line(
+            Point::new(cx + (s as f32 * a1.cos()) as i32, cy + (s as f32 * a1.sin()) as i32),
+            Point::new(cx + (s as f32 * a2.cos()) as i32, cy + (s as f32 * a2.sin()) as i32),
+        )?;
+    }
+    // recents: square
+    let cx = win_w as i32 * 5 / 6;
+    canvas.draw_rect(Rect::new(
+        cx - s + 2,
+        cy - s + 2,
+        (s * 2 - 4) as u32,
+        (s * 2 - 4) as u32,
+    ))?;
+    Ok(())
 }
 
 fn spawn_recorder(serial: Option<&str>) -> std::io::Result<Child> {
@@ -750,6 +799,18 @@ fn mirror_main(serial: Option<String>) -> Result<(), Box<dyn std::error::Error>>
                     mouse_btn: MouseButton::Left,
                     ..
                 } => {
+                    // navigation bar: back / home / recents (no touch path)
+                    if y >= win_h as i32 - NAV_BAR_H {
+                        let key = if x < win_w as i32 / 3 {
+                            4 // BACK
+                        } else if x < win_w as i32 * 2 / 3 {
+                            3 // HOME
+                        } else {
+                            187 // APP_SWITCH (recents)
+                        };
+                        keyevent(&mut input_pipe, serial.as_deref(), key);
+                        continue;
+                    }
                     if let Some((px, py)) = map_to_phone(x, y, win_w, win_h) {
                         drag = Some((px, py));
                         drag_moved = false;
@@ -924,6 +985,7 @@ fn mirror_main(serial: Option<String>) -> Result<(), Box<dyn std::error::Error>>
             let (win_w, win_h) = canvas.output_size()?;
             let (dst, _) = view_rect(win_w, win_h);
             canvas.copy(&texture, None, Some(dst))?;
+            draw_nav_bar(&mut canvas, win_w, win_h)?;
             canvas.present();
             frames += 1;
             if title_t.elapsed().as_secs() >= 2 {
