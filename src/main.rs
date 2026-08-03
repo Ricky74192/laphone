@@ -27,6 +27,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -44,6 +45,7 @@ const PHONE_H: u32 = 2400;
 const BITRATE: &str = "8M";
 const WHEEL_DIST: i32 = 50; // half-distance per wheel notch (100 phone px total)
 const WHEEL_MS: u32 = 120; // slow drag per notch -> no fling inertia
+const INPUT_PORT: u16 = 27047; // adb forward tcp:<port> localabstract:laphone_input
 
 /// Suppress the console window of spawned console-subsystem children (adb,
 /// reg) when this process is a GUI-subsystem binary without a console —
@@ -158,6 +160,150 @@ impl InputPipe {
     }
 }
 
+/// Low-latency touch channel: the on-phone native server (server/native,
+/// `laphone-input`) creates a virtual touchscreen via /dev/uinput and injects
+/// kernel-level events — sub-ms per event vs ~70-100 ms per `input` command.
+///
+/// Transport: `adb forward tcp:27047 localabstract:laphone_input`, then
+/// line-based commands: `tap x y | down x y | move x y | up x y | swipe x1 y1 x2 y2 ms`.
+///
+/// Touch commands prefer the server; on any failure the caller falls back to
+/// the `input motionevent` pipe (InputPipe). Keys/text keep using the pipe
+/// (the server has no keyboard device yet).
+struct InputServer {
+    stream: TcpStream,
+    /// The `adb shell` hosting the server on the phone; killed on drop so
+    /// the uinput device disappears (kernel cleans up on fd close).
+    server_proc: Child,
+}
+
+impl InputServer {
+    /// Locate the native server binary (env → exe dir → cwd/server/build).
+    fn find_binary() -> Option<std::path::PathBuf> {
+        if let Ok(p) = env::var("LAPHONE_SERVER_BIN") {
+            let p = std::path::PathBuf::from(p);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+        for base in [
+            env::current_exe().ok()?.parent()?.to_path_buf(),
+            env::current_dir().ok()?,
+        ] {
+            let p = base.join("server").join("build").join("laphone-input");
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+        None
+    }
+
+    /// Push the server binary, start it on the phone, set up the forward and
+    /// connect. Returns None (silently) when any step fails — the caller
+    /// keeps using the pipe fallback.
+    ///
+    /// OFF BY DEFAULT: on this Xiaomi 13 / HyperOS the kernel blocks
+    /// INPUT_PROP_DIRECT on virtual devices (UI_SET_PROPBIT → EINVAL), so
+    /// InputReader classifies the uinput device as a POINTER and its taps
+    /// never become real clicks (verified on device; `input tap` works, the
+    /// uinput tap does not). Enable with LAPHONE_INPUT_SERVER=1 only on
+    /// devices where POINTER-mode clicks were verified to work.
+    fn start(serial: Option<&str>) -> Option<InputServer> {
+        if env::var("LAPHONE_INPUT_SERVER").as_deref() != Ok("1") {
+            return None;
+        }
+        let bin = Self::find_binary()?;
+        // 1. push + chmod (silent; one-off cost per mirror launch)
+        let mut push_cmd = Command::new("adb");
+        if let Some(s) = serial {
+            push_cmd.arg("-s").arg(s);
+        }
+        let push = no_window(&mut push_cmd)
+            .args(["push", bin.to_str()?, "/data/local/tmp/laphone-input"])
+            .output()
+            .ok()?;
+        if !push.status.success() {
+            return None;
+        }
+        let mut chmod_cmd = Command::new("adb");
+        if let Some(s) = serial {
+            chmod_cmd.arg("-s").arg(s);
+        }
+        let _ = no_window(&mut chmod_cmd)
+            .args(["shell", "chmod 755 /data/local/tmp/laphone-input"])
+            .status()
+            .ok()?;
+        // 2. spawn the server (long-lived; killed on drop)
+        let mut cmd = Command::new("adb");
+        if let Some(s) = serial {
+            cmd.arg("-s").arg(s);
+        }
+        let mut server_proc = no_window(&mut cmd)
+            .args(["shell", "/data/local/tmp/laphone-input"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        // 3. forward: clear stale entry first (fixed port; multi-device TODO)
+        let _ = no_window(&mut Command::new("adb"))
+            .args(["forward", "--remove", &format!("tcp:{INPUT_PORT}")])
+            .status();
+        let mut fwd_cmd = Command::new("adb");
+        if let Some(s) = serial {
+            fwd_cmd.arg("-s").arg(s);
+        }
+        let fwd = no_window(&mut fwd_cmd)
+            .args([
+                "forward",
+                &format!("tcp:{INPUT_PORT}"),
+                "localabstract:laphone_input",
+            ])
+            .output()
+            .ok()?;
+        if !fwd.status.success() {
+            let _ = server_proc.kill();
+            return None;
+        }
+        // 4. connect with retries (the server takes ~1 s to create the device)
+        let mut stream = None;
+        for _ in 0..10 {
+            match TcpStream::connect_timeout(
+                &format!("127.0.0.1:{INPUT_PORT}")
+                    .parse()
+                    .ok()?,
+                Duration::from_millis(500),
+            ) {
+                Ok(s) => {
+                    stream = Some(s);
+                    break;
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(300)),
+            }
+        }
+        let stream = stream?;
+        let mut server = InputServer {
+            stream,
+            server_proc,
+        };
+        // 5. tell the server the display size so its coordinate mapping matches
+        let _ = server.send(&format!("screen {PHONE_W} {PHONE_H}"));
+        Some(server)
+    }
+
+    /// Write one command line; false when the server is gone.
+    fn send(&mut self, line: &str) -> bool {
+        writeln!(self.stream, "{line}").is_ok()
+    }
+}
+
+impl Drop for InputServer {
+    fn drop(&mut self) {
+        let _ = self.server_proc.kill();
+        let _ = self.server_proc.wait();
+    }
+}
+
 /// Single-quote a string for one line of the persistent shell (embedded ' via
 /// the '\'' idiom).
 fn shell_escape(s: &str) -> String {
@@ -178,8 +324,29 @@ fn keyevent(pipe: &mut Option<InputPipe>, serial: Option<&str>, code: i32) {
     let _ = input_cmd(pipe, serial, &format!("input keyevent {code}"));
 }
 
-/// `input motionevent <ACTION> x y` (via pipe) — DOWN / MOVE / UP.
-fn motion(pipe: &mut Option<InputPipe>, serial: Option<&str>, action: &str, x: i32, y: i32) {
+/// Touch event: prefer the low-latency uinput server; fall back to
+/// `input motionevent` (pipe or one-off shell). A dead server is dropped
+/// (killing its adb shell) so the fallback sticks.
+fn motion(
+    server: &mut Option<InputServer>,
+    pipe: &mut Option<InputPipe>,
+    serial: Option<&str>,
+    action: &str,
+    x: i32,
+    y: i32,
+) {
+    if let Some(s) = server {
+        let line = match action {
+            "DOWN" => format!("down {x} {y}"),
+            "MOVE" => format!("move {x} {y}"),
+            "UP" => format!("up {x} {y}"),
+            _ => return,
+        };
+        if s.send(&line) {
+            return;
+        }
+        *server = None; // dead — fall through to the pipe
+    }
     let _ = input_cmd(pipe, serial, &format!("input motionevent {action} {x} {y}"));
 }
 
@@ -440,7 +607,12 @@ fn mirror_main(serial: Option<String>) -> Result<(), Box<dyn std::error::Error>>
     let mut soft_off = false;
     let mut saved_display: Option<(String, String, String)> = None;
     let mut drag: Option<(i32, i32)> = None; // active pointer (phone coords)
+    let mut drag_moved = false; // any MOVE since DOWN → drag, not tap
     let mut input_pipe = InputPipe::open(serial.as_deref());
+    let mut input_server = InputServer::start(serial.as_deref());
+    if input_server.is_some() {
+        eprintln!("input server: low-latency uinput channel active");
+    }
 
     'main: loop {
         let mouse = events.mouse_state(); // owned snapshot (poll_iter borrows events mutably)
@@ -483,7 +655,15 @@ fn mirror_main(serial: Option<String>) -> Result<(), Box<dyn std::error::Error>>
                 } => {
                     if let Some((px, py)) = map_to_phone(x, y, win_w, win_h) {
                         drag = Some((px, py));
-                        motion(&mut input_pipe, serial.as_deref(), "DOWN", px, py);
+                        drag_moved = false;
+                        motion(
+                            &mut input_server,
+                            &mut input_pipe,
+                            serial.as_deref(),
+                            "DOWN",
+                            px,
+                            py,
+                        );
                     }
                 }
                 // right click → back
@@ -513,7 +693,15 @@ fn mirror_main(serial: Option<String>) -> Result<(), Box<dyn std::error::Error>>
                     if drag.is_some() {
                         if let Some((px, py)) = map_to_phone(x, y, win_w, win_h) {
                             drag = Some((px, py));
-                            motion(&mut input_pipe, serial.as_deref(), "MOVE", px, py);
+                            drag_moved = true;
+                            motion(
+                                &mut input_server,
+                                &mut input_pipe,
+                                serial.as_deref(),
+                                "MOVE",
+                                px,
+                                py,
+                            );
                         }
                     }
                 }
@@ -526,18 +714,46 @@ fn mirror_main(serial: Option<String>) -> Result<(), Box<dyn std::error::Error>>
                 } => {
                     if let Some((sx, sy)) = drag.take() {
                         let pos = map_to_phone(x, y, win_w, win_h).unwrap_or((sx, sy));
-                        motion(&mut input_pipe, serial.as_deref(), "UP", pos.0, pos.1);
+                        if !drag_moved {
+                            // a click: single `tap` on the server, DOWN+UP via pipe
+                            if let Some(s) = &mut input_server {
+                                if s.send(&format!("tap {} {}", pos.0, pos.1)) {
+                                    continue;
+                                }
+                                input_server = None;
+                            }
+                            let _ = input_cmd(
+                                &mut input_pipe,
+                                serial.as_deref(),
+                                &format!(
+                                    "input motionevent DOWN {} {} && input motionevent UP {} {}",
+                                    pos.0, pos.1, pos.0, pos.1
+                                ),
+                            );
+                        } else {
+                            motion(
+                                &mut input_server,
+                                &mut input_pipe,
+                                serial.as_deref(),
+                                "UP",
+                                pos.0,
+                                pos.1,
+                            );
+                        }
                     }
                 }
                 Event::MouseWheel { y, .. } if y != 0 => {
                     // wheel up (y>0) = finger drags down = scroll up; wheel down mirrors it
                     if let Some((px, py)) = map_to_phone(mouse.x(), mouse.y(), win_w, win_h) {
                         let d = WHEEL_DIST * y.signum();
-                        let _ = input_cmd(
-                            &mut input_pipe,
-                            serial.as_deref(),
-                            &format!("input swipe {px} {} {px} {} {WHEEL_MS}", py - d, py + d),
-                        );
+                        let line = format!("swipe {px} {} {px} {} {WHEEL_MS}", py - d, py + d);
+                        if let Some(s) = &mut input_server {
+                            if s.send(&line) {
+                                continue;
+                            }
+                            input_server = None;
+                        }
+                        let _ = input_cmd(&mut input_pipe, serial.as_deref(), &line);
                     }
                 }
                 _ => {}
