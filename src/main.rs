@@ -26,7 +26,7 @@
 
 use std::collections::HashMap;
 use std::env;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -42,6 +42,8 @@ use sdl2::rect::Rect;
 const PHONE_W: u32 = 1080; // TODO: auto-detect via `adb shell wm size`
 const PHONE_H: u32 = 2400;
 const BITRATE: &str = "8M";
+const WHEEL_DIST: i32 = 50; // half-distance per wheel notch (100 phone px total)
+const WHEEL_MS: u32 = 120; // slow drag per notch -> no fling inertia
 
 /// Suppress the console window of spawned console-subsystem children (adb,
 /// reg) when this process is a GUI-subsystem binary without a console —
@@ -122,19 +124,72 @@ fn keycode_to_android(k: Keycode) -> Option<i32> {
     })
 }
 
-/// `adb shell input keyevent <code>`
-fn keyevent(serial: Option<&str>, code: i32) {
-    let _ = shell(serial, &format!("input keyevent {code}"));
+/// A persistent `adb shell` whose stdin we feed `input …` lines into. This
+/// avoids the ~20-40 ms per-command adb spawn overhead: drag moves, wheel
+/// notches and key presses become ~1 ms pipe writes (adb round trip happens
+/// once, when the shell is opened).
+struct InputPipe {
+    child: Child,
+    stdin: std::process::ChildStdin,
 }
 
-/// `adb shell input motionevent <ACTION> x y` — DOWN / MOVE / UP (tap + drag).
-fn motion(serial: Option<&str>, action: &str, x: i32, y: i32) {
-    let _ = shell(serial, &format!("input motionevent {action} {x} {y}"));
+impl InputPipe {
+    fn open(serial: Option<&str>) -> Option<InputPipe> {
+        let mut cmd = Command::new("adb");
+        if let Some(s) = serial {
+            cmd.arg("-s").arg(s);
+        }
+        no_window(&mut cmd)
+            .arg("shell")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()
+            .and_then(|mut child| {
+                let stdin = child.stdin.take()?;
+                Some(InputPipe { child, stdin })
+            })
+    }
+
+    /// Write one shell line; false when the shell / adb transport is gone.
+    fn send(&mut self, line: &str) -> bool {
+        writeln!(self.stdin, "{line}").is_ok()
+    }
 }
 
-/// `adb shell input text <t>` — with `%s` escaping for spaces.
-fn text_input(serial: Option<&str>, t: &str) {
-    let _ = shell(serial, &format!("input text {}", t.replace(' ', "%s")));
+/// Single-quote a string for one line of the persistent shell (embedded ' via
+/// the '\'' idiom).
+fn shell_escape(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Run a shell command through the persistent pipe, falling back to a one-off
+/// `adb shell` if the pipe is unavailable.
+fn input_cmd(pipe: &mut Option<InputPipe>, serial: Option<&str>, cmd: &str) -> bool {
+    match pipe {
+        Some(p) => p.send(cmd),
+        None => shell(serial, cmd).is_some(),
+    }
+}
+
+/// `input keyevent <code>` (via pipe)
+fn keyevent(pipe: &mut Option<InputPipe>, serial: Option<&str>, code: i32) {
+    let _ = input_cmd(pipe, serial, &format!("input keyevent {code}"));
+}
+
+/// `input motionevent <ACTION> x y` (via pipe) — DOWN / MOVE / UP.
+fn motion(pipe: &mut Option<InputPipe>, serial: Option<&str>, action: &str, x: i32, y: i32) {
+    let _ = input_cmd(pipe, serial, &format!("input motionevent {action} {x} {y}"));
+}
+
+/// `input text <t>` (via pipe) — `%s` for spaces, shell-quoted.
+fn text_input(pipe: &mut Option<InputPipe>, serial: Option<&str>, t: &str) {
+    let _ = input_cmd(
+        pipe,
+        serial,
+        &format!("input text {}", shell_escape(&t.replace(' ', "%s"))),
+    );
 }
 
 /// Run an adb shell command, return trimmed stdout (None on failure).
@@ -385,6 +440,7 @@ fn mirror_main(serial: Option<String>) -> Result<(), Box<dyn std::error::Error>>
     let mut soft_off = false;
     let mut saved_display: Option<(String, String, String)> = None;
     let mut drag: Option<(i32, i32)> = None; // active pointer (phone coords)
+    let mut input_pipe = InputPipe::open(serial.as_deref());
 
     'main: loop {
         let mouse = events.mouse_state(); // owned snapshot (poll_iter borrows events mutably)
@@ -411,12 +467,12 @@ fn mirror_main(serial: Option<String>) -> Result<(), Box<dyn std::error::Error>>
                     keycode: Some(k), ..
                 } => {
                     if let Some(code) = keycode_to_android(k) {
-                        keyevent(serial.as_deref(), code);
+                        keyevent(&mut input_pipe, serial.as_deref(), code);
                     }
                 }
                 // printable text (incl. IME composition commit) → input text
                 Event::TextInput { text, .. } if !text.is_empty() => {
-                    text_input(serial.as_deref(), &text);
+                    text_input(&mut input_pipe, serial.as_deref(), &text);
                 }
                 // left press → touch DOWN (drag start); tap = DOWN + UP
                 Event::MouseButtonDown {
@@ -427,7 +483,7 @@ fn mirror_main(serial: Option<String>) -> Result<(), Box<dyn std::error::Error>>
                 } => {
                     if let Some((px, py)) = map_to_phone(x, y, win_w, win_h) {
                         drag = Some((px, py));
-                        motion(serial.as_deref(), "DOWN", px, py);
+                        motion(&mut input_pipe, serial.as_deref(), "DOWN", px, py);
                     }
                 }
                 // right click → back
@@ -438,7 +494,7 @@ fn mirror_main(serial: Option<String>) -> Result<(), Box<dyn std::error::Error>>
                     ..
                 } => {
                     if map_to_phone(x, y, win_w, win_h).is_some() {
-                        keyevent(serial.as_deref(), 4);
+                        keyevent(&mut input_pipe, serial.as_deref(), 4);
                     }
                 }
                 // middle click → home
@@ -449,7 +505,7 @@ fn mirror_main(serial: Option<String>) -> Result<(), Box<dyn std::error::Error>>
                     ..
                 } => {
                     if map_to_phone(x, y, win_w, win_h).is_some() {
-                        keyevent(serial.as_deref(), 3);
+                        keyevent(&mut input_pipe, serial.as_deref(), 3);
                     }
                 }
                 // drag: track the pointer, stream MOVE events
@@ -457,7 +513,7 @@ fn mirror_main(serial: Option<String>) -> Result<(), Box<dyn std::error::Error>>
                     if drag.is_some() {
                         if let Some((px, py)) = map_to_phone(x, y, win_w, win_h) {
                             drag = Some((px, py));
-                            motion(serial.as_deref(), "MOVE", px, py);
+                            motion(&mut input_pipe, serial.as_deref(), "MOVE", px, py);
                         }
                     }
                 }
@@ -470,16 +526,17 @@ fn mirror_main(serial: Option<String>) -> Result<(), Box<dyn std::error::Error>>
                 } => {
                     if let Some((sx, sy)) = drag.take() {
                         let pos = map_to_phone(x, y, win_w, win_h).unwrap_or((sx, sy));
-                        motion(serial.as_deref(), "UP", pos.0, pos.1);
+                        motion(&mut input_pipe, serial.as_deref(), "UP", pos.0, pos.1);
                     }
                 }
                 Event::MouseWheel { y, .. } if y != 0 => {
                     // wheel up (y>0) = finger drags down = scroll up; wheel down mirrors it
                     if let Some((px, py)) = map_to_phone(mouse.x(), mouse.y(), win_w, win_h) {
-                        let d = 60 * y.signum();
-                        let _ = shell(
+                        let d = WHEEL_DIST * y.signum();
+                        let _ = input_cmd(
+                            &mut input_pipe,
                             serial.as_deref(),
-                            &format!("input swipe {px} {} {px} {} 80", py - d, py + d),
+                            &format!("input swipe {px} {} {px} {} {WHEEL_MS}", py - d, py + d),
                         );
                     }
                 }
@@ -559,12 +616,22 @@ fn mirror_main(serial: Option<String>) -> Result<(), Box<dyn std::error::Error>>
             // stream stalled: the screen may have fallen asleep (screenrecord
             // needs the display on). Wake it; if adb itself is unreachable
             // (USB unplugged), give up.
-            if shell(serial.as_deref(), "input keyevent KEYCODE_WAKEUP").is_none() {
+            if !input_cmd(
+                &mut input_pipe,
+                serial.as_deref(),
+                "input keyevent KEYCODE_WAKEUP",
+            ) {
                 eprintln!("adb unreachable — exiting");
                 break 'main;
             }
             last_data = Instant::now();
         }
+    }
+
+    // close the persistent input shell
+    if let Some(mut p) = input_pipe {
+        let _ = p.child.kill();
+        let _ = p.child.wait();
     }
 
     // restore display state if soft-off is still active

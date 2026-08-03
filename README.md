@@ -64,7 +64,7 @@ laphone.exe --uninstall
 
 Note: if a Chinese IME is active in Chinese mode, letters go to the IME — switch it to English mode for key shortcuts like Ctrl+S.
 
-Known M0 limits (→ M1): real pinch zoom needs multi-touch injection (server-side); `input` command latency is ~20-40 ms per gesture (server injection will be sub-ms).
+Known M0 limits (→ M1): real pinch zoom needs multi-touch injection (server-side); input events travel over a persistent `adb shell` pipe (~1 ms per event + phone-side execution) — M1's direct InputManager injection will remove the adb hop entirely.
 
 ## Architecture
 
